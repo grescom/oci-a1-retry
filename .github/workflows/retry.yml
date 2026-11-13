@@ -95,10 +95,17 @@ jobs:
           gh workflow disable retry.yml --repo "$GITHUB_REPOSITORY"
           exit 1
 
+      - name: Chain next run (no gap waiting for cron)
+        if: always() && steps.loop.outcome == 'success' && steps.loop.outputs.status != 'success' && steps.loop.outputs.status != 'fatal'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run retry.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" && echo "Next run queued."
+
       - name: Timeout / transient error
         if: steps.loop.outputs.status != 'success' && steps.loop.outputs.status != 'fatal'
         run: |
-          printf '## No capacity yet\n\n```json\n%s\n```\nNext scheduled run continues.\n' "$(cat result.json)" >> "$GITHUB_STEP_SUMMARY"
+          printf '## No capacity yet\n\n```json\n%s\n```\nNext run was queued automatically.\n' "$(cat result.json)" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.loop.outputs.status }}" = "error" ]; then exit 1; fi
 
       - name: Cleanup secrets
