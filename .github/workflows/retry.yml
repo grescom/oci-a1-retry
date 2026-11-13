@@ -1,0 +1,106 @@
+name: OCI A1 retry
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # every hour; extra runs wait in the concurrency queue
+  workflow_dispatch:
+    inputs:
+      max_runtime_minutes:
+        description: "How long this run keeps retrying (minutes)"
+        required: false
+        default: "340"
+
+concurrency:
+  group: oci-a1
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TZ: Europe/Riga
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install OCI SDK
+        run: pip install -r requirements.txt
+
+      - name: Write config from secrets
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_API_KEY: ${{ secrets.OCI_API_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SETTINGS_ENV: ${{ secrets.SETTINGS_ENV }}
+        run: |
+          umask 077
+          printf '%s\n' "$OCI_API_KEY" > oci_api_key.pem
+          # key_file in the secret points to oci_api_key.pem (relative to oci_config)
+          printf '%s\n' "$OCI_CONFIG" > oci_config
+          printf '%s\n' "$SSH_PUBLIC_KEY" > id_ed25519.pub
+          printf '%s\n' "$SETTINGS_ENV" > settings.env
+          echo "SSH_PUBKEY_FILE=$GITHUB_WORKSPACE/id_ed25519.pub" >> settings.env
+          for f in oci_api_key.pem oci_config id_ed25519.pub settings.env; do
+            [ -s "$f" ] || { echo "::error::$f is empty (secret missing?)"; exit 1; }
+          done
+
+      - name: Retry loop
+        id: loop
+        run: |
+          set +e
+          python launch_a1.py --max-runtime-minutes "${{ inputs.max_runtime_minutes || '340' }}" --result-file result.json
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          [ -f result.json ] || echo '{"status":"error","error":"no result file"}' > result.json
+          echo "status=$(jq -r .status result.json)" >> "$GITHUB_OUTPUT"
+          cat result.json
+
+      - name: On success - summary, issue, disable workflow
+        if: steps.loop.outputs.status == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OCID=$(jq -r .instance_ocid result.json)
+          IP=$(jq -r '.public_ip // ""' result.json)
+          STATE=$(jq -r '.state // ""' result.json)
+          NAME=$(jq -r '.display_name // ""' result.json)
+          BODY=$(printf 'Instance **%s** is up.\n\n- OCID: `%s`\n- Public IP: `%s`\n- State: %s\n\nSSH: `ssh -i id_ed25519 ubuntu@%s`\n\nWorkflow run: %s\n' \
+            "$NAME" "$OCID" "${IP:-n/a}" "$STATE" "${IP:-<ip>}" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          printf '## A1 instance created\n\n%s\n' "$BODY" >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "A1 instance created" --body "$BODY"
+          gh workflow disable retry.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: On fatal error - issue, disable workflow
+        if: steps.loop.outputs.status == 'fatal'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KIND=$(jq -r '.kind // ""' result.json)
+          ERR=$(jq -r '.error // ""' result.json)
+          BODY=$(printf 'The retry loop stopped on a fatal error, workflow disabled.\n\n- Kind: %s\n- Error:\n```\n%s\n```\n\nWorkflow run: %s\n\nFix the cause, then re-enable the workflow (Actions -> OCI A1 retry -> Enable).\n' \
+            "$KIND" "$ERR" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          printf '## A1 retry failed\n\n%s\n' "$BODY" >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "A1 retry failed" --body "$BODY"
+          gh workflow disable retry.yml --repo "$GITHUB_REPOSITORY"
+          exit 1
+
+      - name: Timeout / transient error
+        if: steps.loop.outputs.status != 'success' && steps.loop.outputs.status != 'fatal'
+        run: |
+          printf '## No capacity yet\n\n```json\n%s\n```\nNext scheduled run continues.\n' "$(cat result.json)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.loop.outputs.status }}" = "error" ]; then exit 1; fi
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f oci_api_key.pem oci_config settings.env

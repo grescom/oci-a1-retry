@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+oci_config
+*.pem
+settings.env
+attempts.log
+daemon.out
+SUCCESS.txt
+result.json
+oci-a1.pid
+id_ed25519
+id_ed25519.pub
