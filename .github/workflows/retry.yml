@@ -51,6 +51,8 @@ jobs:
           printf '%s\n' "$SSH_PUBLIC_KEY" > id_ed25519.pub
           printf '%s\n' "$SETTINGS_ENV" > settings.env
           echo "SSH_PUBKEY_FILE=$GITHUB_WORKSPACE/id_ed25519.pub" >> settings.env
+          # Oracle returns 429 when launches are <90 s apart; 105 s ±15% jitter stays above that
+          echo "RETRY_SECONDS=105" >> settings.env
           for f in oci_api_key.pem oci_config id_ed25519.pub settings.env; do
             [ -s "$f" ] || { echo "::error::$f is empty (secret missing?)"; exit 1; }
           done
